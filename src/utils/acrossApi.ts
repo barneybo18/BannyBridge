@@ -39,7 +39,8 @@ export async function getSuggestedFees(
     outputToken: string,
     amount: string // raw amount
 ): Promise<DepositQuote> {
-    const url = `https://app.across.to/api/suggested-fees?inputToken=${inputToken}&outputToken=${outputToken}&originChainId=${originChainId}&destinationChainId=${destinationChainId}&amount=${amount}`;
+    const baseUrl = import.meta.env.VITE_ACROSS_API_URL || 'https://app.across.to/api';
+    const url = `${baseUrl}/suggested-fees?inputToken=${inputToken}&outputToken=${outputToken}&originChainId=${originChainId}&destinationChainId=${destinationChainId}&amount=${amount}`;
 
     const response = await fetch(url);
 

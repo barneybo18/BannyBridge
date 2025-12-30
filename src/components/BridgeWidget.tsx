@@ -1,7 +1,7 @@
 
 import { useState, useEffect } from 'react';
-import { ArrowDown, Wallet, ShieldCheck, X, ChevronDown } from 'lucide-react';
-import { useAccount, useConnect, useDisconnect, useBalance, useReadContract, useWriteContract, useWaitForTransactionReceipt } from 'wagmi';
+import { ArrowDown, Wallet, ShieldCheck, X, ChevronDown, RefreshCw } from 'lucide-react';
+import { useAccount, useConnect, useDisconnect, useBalance, useReadContract, useWriteContract, useWaitForTransactionReceipt, useSwitchChain } from 'wagmi';
 import { formatUnits, parseUnits } from 'viem';
 import TokenSelector from './TokenSelector';
 import { CHAINS } from '../constants/chains';
@@ -9,6 +9,7 @@ import type { Chain, Token } from '../constants/chains';
 import { ERC20_ABI, SPOKE_POOL_ABI, SPOKE_POOL_ADDRESSES, WETH_ADDRESSES } from '../constants/contracts';
 import { getSuggestedFees } from '../utils/acrossApi';
 import type { DepositQuote } from '../utils/acrossApi';
+import { getTokenPrice } from '../utils/priceApi';
 
 const BridgeWidget = () => {
     // Input state
@@ -30,9 +31,10 @@ const BridgeWidget = () => {
     const [selectorType, setSelectorType] = useState<'from' | 'to'>('from');
 
     // Wallet state
-    const { address, isConnected } = useAccount();
+    const { address, isConnected, chain: connectedChain } = useAccount();
     const { connectors, connect } = useConnect();
     const { disconnect } = useDisconnect();
+    const { switchChain, isPending: isSwitchingChain } = useSwitchChain();
 
     // Balance fetching (Native)
     const { data: nativeBalance } = useBalance({
@@ -64,9 +66,23 @@ const BridgeWidget = () => {
     const [quote, setQuote] = useState<DepositQuote | null>(null);
     const [isFetchingQuote, setIsFetchingQuote] = useState(false);
     const [quoteError, setQuoteError] = useState<string | null>(null);
+    const [tokenPrice, setTokenPrice] = useState<number>(1);
+    const [refreshCountdown, setRefreshCountdown] = useState<number>(30);
+    const [refreshTrigger, setRefreshTrigger] = useState<number>(0);
 
+    // Fetch token price
+    useEffect(() => {
+        const fetchPrice = async () => {
+            const price = await getTokenPrice(fromToken.symbol);
+            setTokenPrice(price);
+        };
+        fetchPrice();
+    }, [fromToken.symbol]);
+
+    // Quote fetching with auto-refresh
     useEffect(() => {
         let isCancelled = false;
+        let refreshInterval: number;
 
         const fetchQuote = async () => {
             if (!fromAmount || parseFloat(fromAmount) <= 0) {
@@ -107,7 +123,10 @@ const BridgeWidget = () => {
                     rawAmount
                 );
 
-                if (!isCancelled) setQuote(quoteData);
+                if (!isCancelled) {
+                    setQuote(quoteData);
+                    setRefreshCountdown(30); // Reset countdown
+                }
             } catch (err) {
                 console.error("Error fetching quote:", err);
                 if (!isCancelled) {
@@ -121,11 +140,33 @@ const BridgeWidget = () => {
 
         const timeoutId = setTimeout(fetchQuote, 500); // 500ms debounce
 
+        // Set up auto-refresh every 30 seconds if we have a valid amount
+        if (fromAmount && parseFloat(fromAmount) > 0) {
+            refreshInterval = setInterval(() => {
+                fetchQuote();
+            }, 30000); // 30 seconds
+        }
+
         return () => {
             isCancelled = true;
             clearTimeout(timeoutId);
+            if (refreshInterval) clearInterval(refreshInterval);
         };
-    }, [fromAmount, fromChain.id, toChain.id, fromToken.address, fromToken.decimals, fromToken.isNative, toToken.address, toToken.isNative]);
+    }, [fromAmount, fromChain.id, toChain.id, fromToken.address, fromToken.decimals, fromToken.isNative, toToken.address, toToken.isNative, refreshTrigger]);
+
+    // Countdown timer for quote refresh
+    useEffect(() => {
+        if (!quote || !fromAmount || parseFloat(fromAmount) <= 0) return;
+
+        const countdownInterval = setInterval(() => {
+            setRefreshCountdown((prev) => {
+                if (prev <= 1) return 30;
+                return prev - 1;
+            });
+        }, 1000);
+
+        return () => clearInterval(countdownInterval);
+    }, [quote, fromAmount]);
 
     // Contract interactions
     const spokePoolAddress = SPOKE_POOL_ADDRESSES[fromChain.id];
@@ -139,8 +180,8 @@ const BridgeWidget = () => {
         }
     });
 
-    const { writeContract: writeApprove, isPending: isApproving, data: approveTxHash } = useWriteContract();
-    const { writeContract: writeDeposit, isPending: isDepositing, data: depositTxHash } = useWriteContract();
+    const { writeContract: writeApprove, isPending: isApproving, data: approveTxHash, error: approveError } = useWriteContract();
+    const { writeContract: writeDeposit, isPending: isDepositing, data: depositTxHash, error: depositError } = useWriteContract();
 
     // Transaction receipts
     const { isLoading: isWaitingApprove, isSuccess: isApproveSuccess } = useWaitForTransactionReceipt({
@@ -154,11 +195,46 @@ const BridgeWidget = () => {
         }
     }, [isApproveSuccess, refetchAllowance]);
 
+    // Log errors
+    useEffect(() => {
+        if (approveError) {
+            console.error("Approve error from wagmi:", approveError);
+        }
+    }, [approveError]);
+
+    useEffect(() => {
+        if (depositError) {
+            console.error("Deposit error from wagmi:", depositError);
+        }
+    }, [depositError]);
+
     const { isLoading: isWaitingDeposit } = useWaitForTransactionReceipt({ hash: depositTxHash });
+
+    // Pause countdown when transaction is pending
+    useEffect(() => {
+        const isTransactionPending = isApproving || isWaitingApprove || isDepositing || isWaitingDeposit;
+        if (isTransactionPending) {
+            // Freeze countdown at current value when transaction is pending
+            setRefreshCountdown(prev => prev);
+        }
+    }, [isApproving, isWaitingApprove, isDepositing, isWaitingDeposit]);
 
     const handleConnect = () => {
         const connector = connectors[0];
         if (connector) connect({ connector });
+    };
+
+    const handleRefreshQuote = () => {
+        setRefreshTrigger(prev => prev + 1);
+        setRefreshCountdown(30);
+    };
+
+    const handleSwitchChain = async () => {
+        try {
+            await switchChain({ chainId: fromChain.id });
+        } catch (error) {
+            console.error("Error switching chain:", error);
+        }
     };
 
     const formatAddress = (addr: string) => `${addr.slice(0, 6)}...${addr.slice(-4)}`;
@@ -190,7 +266,8 @@ const BridgeWidget = () => {
             abi: ERC20_ABI,
             functionName: 'approve',
             args: [spokePoolAddress, BigInt(parseUnits(fromAmount, fromToken.decimals))],
-            chainId: fromChain.id
+            chainId: fromChain.id,
+            gas: 100000n, // Explicit gas limit for approval
         });
     };
 
@@ -199,6 +276,12 @@ const BridgeWidget = () => {
 
         if (!quote || !quote.outputAmount) {
             console.error("Missing quote or output amount", quote);
+            return;
+        }
+
+        // Validate spokePoolAddress
+        if (!spokePoolAddress) {
+            console.error("SpokePool address not found for chain:", fromChain.id);
             return;
         }
 
@@ -216,39 +299,63 @@ const BridgeWidget = () => {
             ? WETH_ADDRESSES[toChain.id]
             : toToken.address;
 
-        console.log("Calling depositV3 with:", {
+        // Validate token addresses
+        if (!inputTokenAddress || !outputTokenAddress) {
+            console.error("Token addresses not found", { inputTokenAddress, outputTokenAddress });
+            return;
+        }
+
+        const depositParams = {
             spokePoolAddress,
             depositor: address,
             recipient,
             inputToken: inputTokenAddress,
             outputToken: outputTokenAddress,
-            amount: amountBigInt,
-            outputAmount,
+            amount: amountBigInt.toString(),
+            outputAmount: outputAmount.toString(),
             destinationChainId: toChain.id,
-            totalFee: quote.totalRelayFee.total
-        });
+            quoteTimestamp: quote.timestamp,
+            fillDeadline: quote.fillDeadline,
+            exclusivityDeadline: quote.exclusivityDeadline,
+            totalFee: quote.totalRelayFee.total,
+            tokenSymbol: fromToken.symbol,
+            humanReadableAmount: fromAmount,
+            isNativeToken: fromToken.isNative,
+            ethValue: fromToken.isNative ? fromAmount : '0'
+        };
 
-        writeDeposit({
-            address: spokePoolAddress,
-            abi: SPOKE_POOL_ABI,
-            functionName: 'depositV3',
-            args: [
-                address as `0x${string}`, // depositor
-                recipient as `0x${string}`, // recipient
-                inputTokenAddress as `0x${string}`, // inputToken
-                outputTokenAddress as `0x${string}`, // outputToken
-                amountBigInt, // inputAmount
-                outputAmount, // outputAmount (from API)
-                BigInt(toChain.id), // destinationChainId
-                '0x0000000000000000000000000000000000000000', // exclusiveRelayer
-                Number(quote.timestamp), // quoteTimestamp
-                Number(quote.fillDeadline), // fillDeadline
-                Number(quote.exclusivityDeadline), // exclusivityDeadline
-                '0x', // message
-            ],
-            chainId: fromChain.id,
-            value: fromToken.isNative ? amountBigInt : 0n, // Send ETH if native
-        });
+        console.log("=== BRIDGE TRANSACTION ===");
+        console.log(`Bridging ${fromAmount} ${fromToken.symbol} from ${fromChain.name} to ${toChain.name}`);
+        console.log(`ETH Value: ${fromToken.isNative ? fromAmount : '0'} (${fromToken.isNative ? 'Native ETH' : 'ERC20 Token - uses contract call'})`);
+        console.log("Full params:", depositParams);
+
+        try {
+            writeDeposit({
+                address: spokePoolAddress,
+                abi: SPOKE_POOL_ABI,
+                functionName: 'depositV3',
+                args: [
+                    address as `0x${string}`, // depositor
+                    recipient as `0x${string}`, // recipient
+                    inputTokenAddress as `0x${string}`, // inputToken
+                    outputTokenAddress as `0x${string}`, // outputToken
+                    amountBigInt, // inputAmount
+                    outputAmount, // outputAmount (from API)
+                    BigInt(toChain.id), // destinationChainId
+                    '0x0000000000000000000000000000000000000000' as `0x${string}`, // exclusiveRelayer
+                    Number(quote.timestamp), // quoteTimestamp
+                    Number(quote.fillDeadline), // fillDeadline
+                    Number(quote.exclusivityDeadline), // exclusivityDeadline
+                    '0x' as `0x${string}`, // message
+                ],
+                chainId: fromChain.id,
+                value: fromToken.isNative ? amountBigInt : 0n, // Send ETH if native
+                gas: 500000n, // Explicit gas limit
+            });
+            console.log("writeDeposit called successfully");
+        } catch (error) {
+            console.error("Error calling writeDeposit:", error);
+        }
     };
 
     const needsApproval = !fromToken.isNative &&
@@ -261,8 +368,12 @@ const BridgeWidget = () => {
         ? parseFloat(formatUnits(BigInt(quote.outputAmount), toToken.decimals)).toFixed(6)
         : '';
 
-    // USD Estimation (assuming $1 for responsiveness)
-    const usdValue = (parseFloat(fromAmount) || 0).toFixed(2);
+    // Check if wallet is on correct chain
+    const isWrongChain = isConnected && connectedChain?.id !== fromChain.id;
+
+    // USD Estimation using real token price
+    const usdValue = ((parseFloat(fromAmount) || 0) * tokenPrice).toFixed(2);
+    const toUsdValue = toAmountDisplay ? (parseFloat(toAmountDisplay) * tokenPrice).toFixed(2) : '0.00';
 
 
     return (
@@ -279,7 +390,25 @@ const BridgeWidget = () => {
             {/* From Section */}
             <div className="bg-[#1b1b1b] rounded-2xl p-4 mb-2 relative border border-white/5 shadow-xl">
                 <div className="flex justify-between items-center mb-4">
-                    <span className="text-gray-400 text-sm font-medium">From</span>
+                    <div className="flex items-center gap-2">
+                        <span className="text-gray-400 text-sm font-medium">From</span>
+                        {quote && fromAmount && parseFloat(fromAmount) > 0 && (
+                            <div className="flex items-center gap-2">
+                                <span className="text-gray-500 text-xs flex items-center gap-1">
+                                    <span className="w-1.5 h-1.5 bg-green-500 rounded-full animate-pulse"></span>
+                                    Refreshing in {refreshCountdown}s
+                                </span>
+                                <button
+                                    onClick={handleRefreshQuote}
+                                    disabled={isFetchingQuote}
+                                    className="text-gray-400 hover:text-white transition-colors disabled:opacity-50"
+                                    title="Refresh quote"
+                                >
+                                    <RefreshCw className={`w-3.5 h-3.5 ${isFetchingQuote ? 'animate-spin' : ''}`} />
+                                </button>
+                            </div>
+                        )}
+                    </div>
                     <div className="flex items-center gap-2">
                         <button
                             onClick={() => openSelector('from')}
@@ -392,7 +521,7 @@ const BridgeWidget = () => {
                             />
                         )}
                         <div className="text-gray-500 text-sm mt-1">
-                            {toAmountDisplay ? `$${(parseFloat(toAmountDisplay) * 1).toFixed(2)}` : '$0.00'}
+                            ${toUsdValue}
                         </div>
                     </div>
                     <div className="text-gray-500 text-sm mb-1">
@@ -465,7 +594,16 @@ const BridgeWidget = () => {
                     </button>
                 ) : (
                     <div className="flex flex-col gap-2">
-                        {needsApproval ? (
+                        {isWrongChain ? (
+                            <button
+                                onClick={handleSwitchChain}
+                                disabled={isSwitchingChain}
+                                className="w-full bg-[#fbbf24] hover:bg-[#f59e0b] text-[#0f172a] font-bold py-3.5 rounded-xl transition-all hover:scale-[1.01] active:scale-[0.99] flex items-center justify-center gap-2"
+                            >
+                                {isSwitchingChain && <div className="w-5 h-5 animate-spin border-2 border-[#0f172a]/20 border-t-[#0f172a] rounded-full"></div>}
+                                {isSwitchingChain ? 'Switching...' : `Switch to ${fromChain.name}`}
+                            </button>
+                        ) : needsApproval ? (
                             <button
                                 onClick={handleApprove}
                                 disabled={isApproving || isWaitingApprove}
@@ -486,6 +624,11 @@ const BridgeWidget = () => {
                         )}
 
                         <div className="text-xs text-center text-gray-500 cursor-pointer hover:text-white" onClick={() => disconnect()}>
+                            {isWrongChain && (
+                                <div className="mb-1 text-yellow-500 font-medium">
+                                    ⚠️ Connected to {connectedChain?.name || 'Unknown Network'}
+                                </div>
+                            )}
                             Disconnect {formatAddress(address || '')}
                         </div>
                     </div>
