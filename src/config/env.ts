@@ -2,7 +2,7 @@
 
 export const config = {
     // API URLs
-    acrossApiUrl: import.meta.env.VITE_ACROSS_API_URL || 'https://app.across.to/api',
+    acrossApiUrl: import.meta.env.DEV ? '/api' : (import.meta.env.VITE_ACROSS_API_URL || 'https://app.across.to/api'),
     coinGeckoApiUrl: import.meta.env.VITE_COINGECKO_API_URL || 'https://api.coingecko.com/api/v3',
 
     // App Configuration

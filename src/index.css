@@ -1,8 +1,119 @@
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
+
+:root {
+    --deep-space: #050b1c;
+    --space-blue: #0A0E27;
+    --electric-blue: #2D5BFF;
+    --cyber-blue: #00D4FF;
+    --neon-blue: #4DFFFF;
+    --glass-border: rgba(45, 91, 255, 0.1);
+    --glass-bg: rgba(10, 14, 39, 0.7);
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
 body {
-  background-color: #121212; /* Dark background as per design */
-  color: white;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', without-serif;
+    background-color: var(--deep-space);
+    background-image:
+        radial-gradient(circle at 15% 50%, rgba(45, 91, 255, 0.08) 0%, transparent 25%),
+        radial-gradient(circle at 85% 30%, rgba(0, 212, 255, 0.05) 0%, transparent 25%);
+    color: #E2E8F0;
+    min-height: 100vh;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    overflow-x: hidden;
+}
+
+/* Futuristic Scrollbar */
+::-webkit-scrollbar {
+    width: 6px;
+}
+
+::-webkit-scrollbar-track {
+    background: var(--space-blue);
+}
+
+::-webkit-scrollbar-thumb {
+    background: var(--electric-blue);
+    border-radius: 3px;
+}
+
+/* Animations */
+@keyframes float {
+
+    0%,
+    100% {
+        transform: translateY(0);
+    }
+
+    50% {
+        transform: translateY(-10px);
+    }
+}
+
+@keyframes glow {
+
+    0%,
+    100% {
+        box-shadow: 0 0 5px var(--electric-blue), 0 0 10px var(--electric-blue);
+    }
+
+    50% {
+        box-shadow: 0 0 20px var(--electric-blue), 0 0 30px var(--cyber-blue);
+    }
+}
+
+@keyframes drift {
+    0% {
+        transform: translate(0, 0) rotate(0deg);
+    }
+
+    25% {
+        transform: translate(10px, 15px) rotate(5deg);
+    }
+
+    50% {
+        transform: translate(0, 30px) rotate(0deg);
+    }
+
+    75% {
+        transform: translate(-10px, 15px) rotate(-5deg);
+    }
+
+    100% {
+        transform: translate(0, 0) rotate(0deg);
+    }
+}
+
+@keyframes slow-spin {
+    from {
+        transform: rotate(0deg);
+    }
+
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+.animate-float {
+    animation: float 6s ease-in-out infinite;
+}
+
+.animate-drift {
+    animation: drift 20s ease-in-out infinite;
+}
+
+.animate-slow-spin {
+    animation: slow-spin 60s linear infinite;
 }

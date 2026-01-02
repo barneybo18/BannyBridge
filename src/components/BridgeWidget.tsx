@@ -1,17 +1,25 @@
-
 import { useState, useEffect } from 'react';
-import { ArrowDown, Wallet, ShieldCheck, X, ChevronDown, RefreshCw } from 'lucide-react';
-import { useAccount, useConnect, useDisconnect, useBalance, useReadContract, useWriteContract, useWaitForTransactionReceipt, useSwitchChain } from 'wagmi';
+import { ArrowDown, X, ChevronDown, RefreshCw, Settings, Info } from 'lucide-react';
+import { useAccount, useConnect, useBalance, useReadContract, useWriteContract, useWaitForTransactionReceipt, useSwitchChain } from 'wagmi';
 import { formatUnits, parseUnits } from 'viem';
 import TokenSelector from './TokenSelector';
-import { CHAINS } from '../constants/chains';
+import { CHAINS, TESTNET_CHAINS } from '../constants/chains';
 import type { Chain, Token } from '../constants/chains';
 import { ERC20_ABI, SPOKE_POOL_ABI, SPOKE_POOL_ADDRESSES, WETH_ADDRESSES } from '../constants/contracts';
-import { getSuggestedFees } from '../utils/acrossApi';
-import type { DepositQuote } from '../utils/acrossApi';
+import { getQuote, type QuoteResult } from '../utils/acrossApi';
 import { getTokenPrice } from '../utils/priceApi';
 
+import { APP_FEE_PERCENTAGE } from '../constants/integrator';
+import TransactionModal from './TransactionModal';
+
 const BridgeWidget = () => {
+    // App Mode State
+    const [isTestnet, setIsTestnet] = useState(false);
+    const [settingsOpen, setSettingsOpen] = useState(false);
+
+    // Active Chains based on mode
+    const activeChains = isTestnet ? TESTNET_CHAINS : CHAINS;
+
     // Input state
     const [fromAmount, setFromAmount] = useState('');
 
@@ -20,29 +28,56 @@ const BridgeWidget = () => {
     const [isEditingRecipient, setIsEditingRecipient] = useState(false);
 
     // Default selections
-    const [fromChain, setFromChain] = useState<Chain>(CHAINS[1]); // Base
-    const [fromToken, setFromToken] = useState<Token>(CHAINS[1].tokens[1]); // USDC
+    // Default selections (Update when chains change)
+    useEffect(() => {
+        // Reset selections when switching modes
+        if (isTestnet) {
+            setFromChain(activeChains[0]); // Sepolia
+            setFromToken(activeChains[0].tokens[0]); // ETH
+            setToChain(activeChains[1]); // Arbitrum Sepolia
+            setToToken(activeChains[1].tokens[0]); // ETH
+        } else {
+            setFromChain(activeChains[4]); // Base
+            setFromToken(activeChains[4].tokens.find(t => t.symbol === 'USDC') || activeChains[4].tokens[1]);
+            setToChain(activeChains[5]); // Arbitrum
+            setToToken(activeChains[5].tokens.find(t => t.symbol === 'USDC') || activeChains[5].tokens[1]);
+        }
+    }, [isTestnet]);
 
-    const [toChain, setToChain] = useState<Chain>(CHAINS[2]); // Arbitrum
-    const [toToken, setToToken] = useState<Token>(CHAINS[2].tokens[1]); // USDC
+    const [fromChain, setFromChain] = useState<Chain>(() => activeChains[isTestnet ? 0 : 4]);
+    const [fromToken, setFromToken] = useState<Token>(() => {
+        const chain = activeChains[isTestnet ? 0 : 4];
+        return isTestnet ? chain.tokens[0] : (chain.tokens.find(t => t.symbol === 'USDC') || chain.tokens[1]);
+    });
+
+    const [toChain, setToChain] = useState<Chain>(() => activeChains[isTestnet ? 1 : 5]);
+    const [toToken, setToToken] = useState<Token>(() => {
+        const chain = activeChains[isTestnet ? 1 : 5];
+        return isTestnet ? chain.tokens[0] : (chain.tokens.find(t => t.symbol === 'USDC') || chain.tokens[1]);
+    });
 
     // Selector state
     const [selectorOpen, setSelectorOpen] = useState(false);
     const [selectorType, setSelectorType] = useState<'from' | 'to'>('from');
 
+    // Transaction Modal State
+    const [showModal, setShowModal] = useState(false);
+    const [txStatus, setTxStatus] = useState<'idle' | 'processing' | 'success' | 'error'>('idle');
+    const [currentTxHash, setCurrentTxHash] = useState<string | undefined>(undefined);
+    const [txError, setTxError] = useState<string | undefined>(undefined);
+
     // Wallet state
     const { address, isConnected, chain: connectedChain } = useAccount();
     const { connectors, connect } = useConnect();
-    const { disconnect } = useDisconnect();
-    const { switchChain, isPending: isSwitchingChain } = useSwitchChain();
+
+    // Removed duplicate declaration and unused disconnect
+    const { switchChain, isPending: isSwitchingChain } = useSwitchChain(); // preserving this line as is
 
     // Balance fetching (Native)
     const { data: nativeBalance } = useBalance({
         address,
         chainId: fromChain.id,
-        query: {
-            enabled: !!address && fromToken.isNative
-        }
+        query: { enabled: !!address && fromToken.isNative }
     });
 
     // Balance fetching (ERC20)
@@ -52,101 +87,85 @@ const BridgeWidget = () => {
         functionName: 'balanceOf',
         args: [address as `0x${string}`],
         chainId: fromChain.id,
-        query: {
-            enabled: !!address && !fromToken.isNative
-        }
+        query: { enabled: !!address && !fromToken.isNative }
     });
 
     const balanceValue = fromToken.isNative ? nativeBalance?.value : tokenBalance;
-    const balanceFormatted = balanceValue !== undefined
-        ? formatUnits(balanceValue, fromToken.decimals)
-        : '0';
+    const balanceFormatted = balanceValue !== undefined ? formatUnits(balanceValue, fromToken.decimals) : '0';
 
     // Quote fetching
-    const [quote, setQuote] = useState<DepositQuote | null>(null);
+    const [quote, setQuote] = useState<QuoteResult | null>(null);
     const [isFetchingQuote, setIsFetchingQuote] = useState(false);
     const [quoteError, setQuoteError] = useState<string | null>(null);
     const [tokenPrice, setTokenPrice] = useState<number>(1);
-    const [refreshCountdown, setRefreshCountdown] = useState<number>(30);
+    const [toTokenPrice, setToTokenPrice] = useState<number>(1);
+    // const [refreshCountdown, setRefreshCountdown] = useState<number>(30); // Removed unused state
     const [refreshTrigger, setRefreshTrigger] = useState<number>(0);
 
-    // Fetch token price
+    // Fetch prices and quotes (logic remains the same, omitted for brevity but included in full file)
     useEffect(() => {
+        let isCancelled = false;
         const fetchPrice = async () => {
+            console.log(`[PriceEffect] Fetching price for ${fromToken.symbol} on chain ${fromChain.id}`);
             const price = await getTokenPrice(fromToken.symbol);
-            setTokenPrice(price);
+            if (!isCancelled) {
+                console.log(`[PriceEffect] Set tokenPrice to ${price}`);
+                setTokenPrice(price);
+            }
         };
         fetchPrice();
-    }, [fromToken.symbol]);
+        return () => { isCancelled = true; };
+    }, [fromToken.symbol, fromChain.id]);
 
-    // Quote fetching with auto-refresh
+    useEffect(() => {
+        let isCancelled = false;
+        const fetchPrice = async () => {
+            const price = await getTokenPrice(toToken.symbol);
+            if (!isCancelled) {
+                setToTokenPrice(price);
+            }
+        };
+        fetchPrice();
+        return () => { isCancelled = true; };
+    }, [toToken.symbol]);
+
     useEffect(() => {
         let isCancelled = false;
         let refreshInterval: number;
-
         const fetchQuote = async () => {
             if (!fromAmount || parseFloat(fromAmount) <= 0) {
                 if (!isCancelled) setQuote(null);
                 return;
             }
-
             if (!isCancelled) {
                 setIsFetchingQuote(true);
                 setQuoteError(null);
             }
-
             try {
-                // Determine decimals based on token
-                const decimals = fromToken.decimals;
-                const rawAmount = parseUnits(fromAmount, decimals).toString();
-
-                // Use WETH address for native ETH quotes, otherwise use token address
-                const inputTokenAddress = fromToken.isNative
-                    ? WETH_ADDRESSES[fromChain.id]
-                    : fromToken.address;
-
-                const outputTokenAddress = toToken.isNative
-                    ? WETH_ADDRESSES[toChain.id]
-                    : toToken.address;
-
-                if (!inputTokenAddress || !outputTokenAddress) {
-                    // This handles cases where WETH mapping might be missing for a chain
-                    console.error("Token address not found (or WETH mapping missing)");
-                    throw new Error("Token address not found");
-                }
-
-                const quoteData = await getSuggestedFees(
-                    fromChain.id,
-                    toChain.id,
-                    inputTokenAddress,
-                    outputTokenAddress,
-                    rawAmount
-                );
-
+                const inputAmount = parseUnits(fromAmount, fromToken.decimals);
+                const inputTokenAddress = fromToken.isNative ? WETH_ADDRESSES[fromChain.id] : fromToken.address;
+                const outputTokenAddress = toToken.isNative ? WETH_ADDRESSES[toChain.id] : toToken.address;
+                if (!inputTokenAddress || !outputTokenAddress) throw new Error("Token address not found");
+                const quoteResult = await getQuote(fromChain.id, toChain.id, inputTokenAddress, outputTokenAddress, inputAmount);
                 if (!isCancelled) {
-                    setQuote(quoteData);
-                    setRefreshCountdown(30); // Reset countdown
+                    setQuote(quoteResult);
+                    // setRefreshCountdown(30); - unused variable removed logic
                 }
             } catch (err) {
-                console.error("Error fetching quote:", err);
                 if (!isCancelled) {
-                    setQuoteError("Failed to fetch quote");
+                    let errorMessage = "Failed to fetch quote";
+                    if (err instanceof Error) errorMessage = err.message;
+                    setQuoteError(errorMessage);
                     setQuote(null);
                 }
             } finally {
                 if (!isCancelled) setIsFetchingQuote(false);
             }
         };
-
-        const timeoutId = setTimeout(fetchQuote, 500); // 500ms debounce
-
-        // Set up auto-refresh every 30 seconds if we have a valid amount
+        const timeoutId = setTimeout(fetchQuote, 500);
         if (fromAmount && parseFloat(fromAmount) > 0) {
-            refreshInterval = setInterval(() => {
-                fetchQuote();
-            }, 30000); // 30 seconds
+            refreshInterval = setInterval(() => { fetchQuote(); }, 30000);
         }
-
         return () => {
             isCancelled = true;
             clearTimeout(timeoutId);
@@ -154,19 +173,19 @@ const BridgeWidget = () => {
         };
     }, [fromAmount, fromChain.id, toChain.id, fromToken.address, fromToken.decimals, fromToken.isNative, toToken.address, toToken.isNative, refreshTrigger]);
 
-    // Countdown timer for quote refresh
+    /* 
+    Unused effect for refreshCountdown
     useEffect(() => {
         if (!quote || !fromAmount || parseFloat(fromAmount) <= 0) return;
-
         const countdownInterval = setInterval(() => {
             setRefreshCountdown((prev) => {
                 if (prev <= 1) return 30;
                 return prev - 1;
             });
         }, 1000);
-
         return () => clearInterval(countdownInterval);
     }, [quote, fromAmount]);
+    */
 
     // Contract interactions
     const spokePoolAddress = SPOKE_POOL_ADDRESSES[fromChain.id];
@@ -175,464 +194,388 @@ const BridgeWidget = () => {
         abi: ERC20_ABI,
         functionName: 'allowance',
         args: [address as `0x${string}`, spokePoolAddress],
-        query: {
-            enabled: !!address && !fromToken.isNative,
-        }
+        query: { enabled: !!address && !fromToken.isNative }
     });
 
-    const { writeContract: writeApprove, isPending: isApproving, data: approveTxHash, error: approveError } = useWriteContract();
-    const { writeContract: writeDeposit, isPending: isDepositing, data: depositTxHash, error: depositError } = useWriteContract();
+    const { writeContract: writeApprove, isPending: isApproving, data: approveTxHash } = useWriteContract();
+    const { writeContract: writeDeposit, isPending: isDepositing, data: depositTxHash } = useWriteContract();
+    // Removed unused useSendTransaction
 
-    // Transaction receipts
-    const { isLoading: isWaitingApprove, isSuccess: isApproveSuccess } = useWaitForTransactionReceipt({
-        hash: approveTxHash
-    });
-
-    // Refetch allowance after approval success
-    useEffect(() => {
-        if (isApproveSuccess) {
-            refetchAllowance();
-        }
-    }, [isApproveSuccess, refetchAllowance]);
-
-    // Log errors
-    useEffect(() => {
-        if (approveError) {
-            console.error("Approve error from wagmi:", approveError);
-        }
-    }, [approveError]);
-
-    useEffect(() => {
-        if (depositError) {
-            console.error("Deposit error from wagmi:", depositError);
-        }
-    }, [depositError]);
+    const { isLoading: _isWaitingApprove, isSuccess: isApproveSuccess } = useWaitForTransactionReceipt({ hash: approveTxHash });
+    useEffect(() => { if (isApproveSuccess) refetchAllowance(); }, [isApproveSuccess, refetchAllowance]);
 
     const { isLoading: isWaitingDeposit } = useWaitForTransactionReceipt({ hash: depositTxHash });
+    // Removed isWaitingSwap
 
-    // Pause countdown when transaction is pending
-    useEffect(() => {
-        const isTransactionPending = isApproving || isWaitingApprove || isDepositing || isWaitingDeposit;
-        if (isTransactionPending) {
-            // Freeze countdown at current value when transaction is pending
-            setRefreshCountdown(prev => prev);
-        }
-    }, [isApproving, isWaitingApprove, isDepositing, isWaitingDeposit]);
-
-    const handleConnect = () => {
-        const connector = connectors[0];
-        if (connector) connect({ connector });
-    };
-
-    const handleRefreshQuote = () => {
-        setRefreshTrigger(prev => prev + 1);
-        setRefreshCountdown(30);
-    };
-
-    const handleSwitchChain = async () => {
-        try {
-            await switchChain({ chainId: fromChain.id });
-        } catch (error) {
-            console.error("Error switching chain:", error);
-        }
-    };
-
+    const handleConnect = () => { const connector = connectors[0]; if (connector) connect({ connector }); };
+    const handleRefreshQuote = () => { setRefreshTrigger(prev => prev + 1); /* setRefreshCountdown(30); */ };
+    const handleSwitchChain = async () => { try { await switchChain({ chainId: fromChain.id }); } catch (error) { console.error("Error switching chain:", error); } };
     const formatAddress = (addr: string) => `${addr.slice(0, 6)}...${addr.slice(-4)}`;
 
-    const openSelector = (type: 'from' | 'to') => {
-        setSelectorType(type);
-        setSelectorOpen(true);
-    };
-
+    const openSelector = (type: 'from' | 'to') => { setSelectorType(type); setSelectorOpen(true); };
     const handleSelect = (chain: Chain, token: Token) => {
-        if (selectorType === 'from') {
-            setFromChain(chain);
-            setFromToken(token);
-        } else {
-            setToChain(chain);
-            setToToken(token);
-        }
+        if (selectorType === 'from') { setFromChain(chain); setFromToken(token); }
+        else { setToChain(chain); setToToken(token); }
     };
-
-    const handleMax = () => {
-        if (balanceFormatted) {
-            setFromAmount(balanceFormatted);
-        }
-    };
+    const handleMax = () => { if (balanceFormatted) setFromAmount(balanceFormatted); };
 
     const handleApprove = () => {
-        writeApprove({
-            address: fromToken.address as `0x${string}`,
-            abi: ERC20_ABI,
-            functionName: 'approve',
-            args: [spokePoolAddress, BigInt(parseUnits(fromAmount, fromToken.decimals))],
-            chainId: fromChain.id,
-            gas: 100000n, // Explicit gas limit for approval
-        });
+        const maxApproval = BigInt('0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff');
+        writeApprove({ address: fromToken.address as `0x${string}`, abi: ERC20_ABI, functionName: 'approve', args: [spokePoolAddress, maxApproval], chainId: fromChain.id });
     };
 
+    const handleSwap = () => {
+        const tempChain = fromChain; const tempToken = fromToken;
+        setFromChain(toChain); setFromToken(toToken);
+        setToChain(tempChain); setToToken(tempToken);
+        setFromAmount('');
+    };
+
+    // const isSameChain = fromChain.id === toChain.id; // Unused variable
     const handleBridge = () => {
-        console.log("handleBridge called", { quote, fromAmount, recipientAddress });
-
-        if (!quote || !quote.outputAmount) {
-            console.error("Missing quote or output amount", quote);
-            return;
-        }
-
-        // Validate spokePoolAddress
-        if (!spokePoolAddress) {
-            console.error("SpokePool address not found for chain:", fromChain.id);
-            return;
-        }
-
+        if (!quote || !quote.deposit.outputAmount || !spokePoolAddress) return;
         const amountBigInt = BigInt(parseUnits(fromAmount, fromToken.decimals));
-        const outputAmount = BigInt(quote.outputAmount);
-
+        const outputAmount = BigInt(quote.deposit.outputAmount);
         const recipient = recipientAddress || address;
-
-        // Resolve WETH addresses for contract call if tokens are native
-        const inputTokenAddress = fromToken.isNative
-            ? WETH_ADDRESSES[fromChain.id]
-            : fromToken.address;
-
-        const outputTokenAddress = toToken.isNative
-            ? WETH_ADDRESSES[toChain.id]
-            : toToken.address;
-
-        // Validate token addresses
-        if (!inputTokenAddress || !outputTokenAddress) {
-            console.error("Token addresses not found", { inputTokenAddress, outputTokenAddress });
-            return;
-        }
-
-        const depositParams = {
-            spokePoolAddress,
-            depositor: address,
-            recipient,
-            inputToken: inputTokenAddress,
-            outputToken: outputTokenAddress,
-            amount: amountBigInt.toString(),
-            outputAmount: outputAmount.toString(),
-            destinationChainId: toChain.id,
-            quoteTimestamp: quote.timestamp,
-            fillDeadline: quote.fillDeadline,
-            exclusivityDeadline: quote.exclusivityDeadline,
-            totalFee: quote.totalRelayFee.total,
-            tokenSymbol: fromToken.symbol,
-            humanReadableAmount: fromAmount,
-            isNativeToken: fromToken.isNative,
-            ethValue: fromToken.isNative ? fromAmount : '0'
-        };
-
-        console.log("=== BRIDGE TRANSACTION ===");
-        console.log(`Bridging ${fromAmount} ${fromToken.symbol} from ${fromChain.name} to ${toChain.name}`);
-        console.log(`ETH Value: ${fromToken.isNative ? fromAmount : '0'} (${fromToken.isNative ? 'Native ETH' : 'ERC20 Token - uses contract call'})`);
-        console.log("Full params:", depositParams);
+        const inputTokenAddress = fromToken.isNative ? WETH_ADDRESSES[fromChain.id] : fromToken.address;
+        const outputTokenAddress = toToken.isNative ? WETH_ADDRESSES[toChain.id] : toToken.address;
 
         try {
             writeDeposit({
-                address: spokePoolAddress,
-                abi: SPOKE_POOL_ABI,
-                functionName: 'depositV3',
-                args: [
-                    address as `0x${string}`, // depositor
-                    recipient as `0x${string}`, // recipient
-                    inputTokenAddress as `0x${string}`, // inputToken
-                    outputTokenAddress as `0x${string}`, // outputToken
-                    amountBigInt, // inputAmount
-                    outputAmount, // outputAmount (from API)
-                    BigInt(toChain.id), // destinationChainId
-                    '0x0000000000000000000000000000000000000000' as `0x${string}`, // exclusiveRelayer
-                    Number(quote.timestamp), // quoteTimestamp
-                    Number(quote.fillDeadline), // fillDeadline
-                    Number(quote.exclusivityDeadline), // exclusivityDeadline
-                    '0x' as `0x${string}`, // message
-                ],
-                chainId: fromChain.id,
-                value: fromToken.isNative ? amountBigInt : 0n, // Send ETH if native
-                gas: 500000n, // Explicit gas limit
+                address: spokePoolAddress, abi: SPOKE_POOL_ABI, functionName: 'depositV3',
+                args: [address as `0x${string}`, recipient as `0x${string}`, inputTokenAddress as `0x${string}`, outputTokenAddress as `0x${string}`, amountBigInt, outputAmount, BigInt(toChain.id), quote.deposit.exclusiveRelayer as `0x${string}`, Number(quote.deposit.quoteTimestamp), Number(quote.deposit.fillDeadline), Number(quote.deposit.exclusivityDeadline), quote.deposit.message as `0x${string}`],
+                chainId: fromChain.id, value: fromToken.isNative ? amountBigInt : 0n, gas: 500000n
+            }, {
+                onSuccess: (hash) => {
+                    setCurrentTxHash(hash);
+                    // Don't set success yet, wait for receipt if possible, but for MVP:
+                    // Actually, writeDeposit success just means tx sent to mempool. 
+                    // We should keep 'processing' until useWaitForTransactionReceipt confirms it.
+                },
+                onError: (error) => {
+                    setTxStatus('error');
+                    setTxError(error.message || 'Transaction rejected');
+                }
             });
-            console.log("writeDeposit called successfully");
+            // Open modal immediately on click
+            setTxStatus('processing');
+            setShowModal(true);
+            setTxError(undefined);
+
         } catch (error) {
             console.error("Error calling writeDeposit:", error);
+            setTxStatus('error');
+            setTxError('Failed to initiate transaction');
         }
     };
 
-    const needsApproval = !fromToken.isNative &&
-        fromAmount &&
-        allowance !== undefined &&
-        allowance < parseUnits(fromAmount, fromToken.decimals);
+    // Watch for deposit receipt to confirm success
+    useEffect(() => {
+        if (isWaitingDeposit) {
+            setTxStatus('processing');
+        } else if (depositTxHash && !isWaitingDeposit && showModal && txStatus !== 'error') {
+            // Simple success check logic - if hash exists and not waiting, assume mined
+            setTxStatus('success');
+        }
+    }, [isWaitingDeposit, depositTxHash, showModal, txStatus]);
 
-    // Calculated To Amount (using API's outputAmount)
-    const toAmountDisplay = quote && quote.outputAmount
-        ? parseFloat(formatUnits(BigInt(quote.outputAmount), toToken.decimals)).toFixed(6)
-        : '';
+    const needsApproval = !fromToken.isNative && fromAmount && allowance !== undefined && allowance < parseUnits(fromAmount, fromToken.decimals);
 
-    // Check if wallet is on correct chain
+    let toAmountDisplay = '';
+    try {
+        if (quote?.deposit.outputAmount) {
+            const outputBigInt = quote.deposit.outputAmount;
+            const formatted = formatUnits(outputBigInt, toToken.decimals);
+            const numericValue = parseFloat(formatted);
+            toAmountDisplay = numericValue.toFixed(numericValue > 0 && numericValue < 0.000001 ? 10 : numericValue > 0 && numericValue < 0.01 ? 8 : 6);
+        }
+    } catch (error) { console.error("Error calculating toAmountDisplay:", error); }
+
     const isWrongChain = isConnected && connectedChain?.id !== fromChain.id;
-
-    // USD Estimation using real token price
     const usdValue = ((parseFloat(fromAmount) || 0) * tokenPrice).toFixed(2);
-    const toUsdValue = toAmountDisplay ? (parseFloat(toAmountDisplay) * tokenPrice).toFixed(2) : '0.00';
-
+    let toUsdValue = '0.00';
+    if (toAmountDisplay) {
+        const usdAmount = parseFloat(toAmountDisplay) * toTokenPrice;
+        toUsdValue = usdAmount > 0 ? (usdAmount < 0.01 ? usdAmount.toFixed(6) : usdAmount < 1 ? usdAmount.toFixed(4) : usdAmount.toFixed(2)) : '0.00';
+    }
 
     return (
-        <div className="w-full max-w-[480px] p-4 mx-auto font-sans">
+        <div className="w-full max-w-[480px] mx-auto relative font-sans">
             <TokenSelector
-                isOpen={selectorOpen}
-                onClose={() => setSelectorOpen(false)}
-                onSelect={handleSelect}
-                type={selectorType}
-                selectedChainId={selectorType === 'from' ? fromChain.id : toChain.id}
+                isOpen={selectorOpen} onClose={() => setSelectorOpen(false)} onSelect={handleSelect}
+                type={selectorType} selectedChainId={selectorType === 'from' ? fromChain.id : toChain.id}
                 selectedTokenSymbol={selectorType === 'from' ? fromToken.symbol : toToken.symbol}
+                isTestnet={isTestnet}
+                fromChainId={selectorType === 'to' ? fromChain.id : undefined}
+                fromTokenSymbol={selectorType === 'to' ? fromToken.symbol : undefined}
             />
 
-            {/* From Section */}
-            <div className="bg-[#1b1b1b] rounded-2xl p-4 mb-2 relative border border-white/5 shadow-xl">
-                <div className="flex justify-between items-center mb-4">
+            <TransactionModal
+                isOpen={showModal}
+                onClose={() => setShowModal(false)}
+                status={txStatus}
+                txHash={currentTxHash || depositTxHash}
+                errorMsg={txError}
+                fromChainName={fromChain.name}
+                toChainName={toChain.name}
+                tokenSymbol={fromToken.symbol}
+                amount={fromAmount}
+                explorerUrl={fromChain.blockExplorerUrl}
+            />
+
+            {/* Main Card */}
+            <div className="bg-[#0A0E27] p-6 rounded-3xl border border-[#2D5BFF]/20 shadow-[0_0_50px_rgba(45,91,255,0.1)] relative overflow-hidden backdrop-blur-xl">
+                {/* Header */}
+                <div className="flex justify-between items-center mb-6">
                     <div className="flex items-center gap-2">
-                        <span className="text-gray-400 text-sm font-medium">From</span>
-                        {quote && fromAmount && parseFloat(fromAmount) > 0 && (
-                            <div className="flex items-center gap-2">
-                                <span className="text-gray-500 text-xs flex items-center gap-1">
-                                    <span className="w-1.5 h-1.5 bg-green-500 rounded-full animate-pulse"></span>
-                                    Refreshing in {refreshCountdown}s
-                                </span>
-                                <button
-                                    onClick={handleRefreshQuote}
-                                    disabled={isFetchingQuote}
-                                    className="text-gray-400 hover:text-white transition-colors disabled:opacity-50"
-                                    title="Refresh quote"
-                                >
-                                    <RefreshCw className={`w-3.5 h-3.5 ${isFetchingQuote ? 'animate-spin' : ''}`} />
-                                </button>
+                        <span className="text-white font-bold text-xl font-space">Bridge</span>
+                        <div className={`px-2 py-0.5 rounded-full border text-[10px] font-bold tracking-wider ${isTestnet ? 'bg-yellow-500/10 border-yellow-500/30 text-yellow-500' : 'bg-[#2D5BFF]/10 border-[#2D5BFF]/30 text-[#2D5BFF]'}`}>
+                            {isTestnet ? 'TESTNET' : 'V2'}
+                        </div>
+                    </div>
+                    <div className="flex gap-2 relative">
+                        <button
+                            type="button"
+                            className="text-gray-400 hover:text-white transition-colors p-2 hover:bg-white/5 rounded-lg"
+                            onClick={handleRefreshQuote}
+                        >
+                            <RefreshCw className={`w-4 h-4 ${isFetchingQuote ? 'animate-spin' : ''}`} />
+                        </button>
+                        <button
+                            className="text-gray-400 hover:text-white transition-colors p-2 hover:bg-white/5 rounded-lg"
+                            onClick={() => setSettingsOpen(!settingsOpen)}
+                        >
+                            <Settings className="w-4 h-4" />
+                        </button>
+
+                        {/* Settings Dropdown */}
+                        {settingsOpen && (
+                            <div className="absolute right-0 top-full mt-2 w-48 bg-[#0A0E27] border border-[#2D5BFF]/30 rounded-xl shadow-xl z-50 overflow-hidden animate-in fade-in zoom-in-95">
+                                <div className="p-3">
+                                    <h4 className="text-xs text-gray-500 uppercase font-bold tracking-wider mb-2">Settings</h4>
+                                    <button
+                                        className="w-full flex items-center justify-between p-2 rounded-lg hover:bg-white/5 transition-colors text-sm text-gray-300 hover:text-white"
+                                        onClick={() => {
+                                            setIsTestnet(!isTestnet);
+                                            setSettingsOpen(false);
+                                        }}
+                                    >
+                                        <span>Mode</span>
+                                        <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${isTestnet ? 'bg-yellow-500/20 text-yellow-500' : 'bg-green-500/20 text-green-500'}`}>
+                                            {isTestnet ? 'TESTNET' : 'MAINNET'}
+                                        </span>
+                                    </button>
+                                </div>
                             </div>
                         )}
                     </div>
-                    <div className="flex items-center gap-2">
-                        <button
-                            onClick={() => openSelector('from')}
-                            className="flex items-center gap-2 bg-[#2b2b2b] hover:bg-[#3b3b3b] transition-colors rounded-full py-1.5 px-3 border border-white/5"
-                        >
-                            <div className={`w-6 h-6 rounded-full ${fromToken.iconBg} flex items-center justify-center text-[10px] text-white font-bold relative`}>
-                                <span className={`absolute -bottom-1 -right-1 ${fromChain.iconBg} rounded-full w-3 h-3 border-2 border-[#2b2b2b]`}></span>
-                                {fromToken.symbol[0]}
-                            </div>
-                            <div className="flex flex-col items-start leading-none">
-                                <span className="text-white font-semibold text-sm">{fromToken.symbol}</span>
-                                <span className="text-gray-400 text-[10px]">{fromChain.name}</span>
-                            </div>
-                            <ChevronDown className="w-4 h-4 text-gray-400" />
-                        </button>
-                    </div>
                 </div>
 
-                <div className="flex justify-between items-end">
-                    <div className="flex-1">
+                {/* From Box */}
+                <div className="bg-[#131b36] rounded-xl p-4 border border-transparent hover:border-[#2D5BFF]/30 transition-all group">
+                    <div className="flex justify-between text-gray-400 text-sm mb-3">
+                        <span className="font-medium">From {fromChain.name}</span>
+                        <div className="flex items-center gap-2">
+                            <span>Balance: {parseFloat(balanceFormatted).toFixed(4)}</span>
+                            <button onClick={handleMax} className="text-[#2D5BFF] text-xs font-bold hover:text-[#4DFFFF] transition-colors">MAX</button>
+                        </div>
+                    </div>
+                    <div className="flex justify-between items-center gap-4">
                         <input
                             type="text"
                             placeholder="0.00"
                             value={fromAmount}
                             onChange={(e) => setFromAmount(e.target.value)}
-                            className="bg-transparent text-4xl text-white font-medium outline-none w-full placeholder-gray-600"
+                            className="bg-transparent text-4xl text-white font-medium outline-none w-full placeholder-gray-600 font-space min-w-0"
                         />
-                        <div className="text-gray-500 text-sm mt-1">
-                            ${usdValue}
-                        </div>
+                        <button
+                            onClick={() => openSelector('from')}
+                            className="flex items-center gap-2 bg-[#0A0E27] hover:bg-[#1A2235] text-white rounded-full pl-2 pr-4 py-1.5 transition-all border border-[#2D5BFF]/20 hover:border-[#2D5BFF]/50 shrink-0"
+                        >
+                            <div className="relative">
+                                {fromToken.logoUrl ? (
+                                    <img src={fromToken.logoUrl} alt={fromToken.symbol} className="w-8 h-8 rounded-full" />
+                                ) : (
+                                    <div className={`w-8 h-8 rounded-full ${fromToken.iconBg} flex items-center justify-center text-[10px] font-bold`}>{fromToken.symbol[0]}</div>
+                                )}
+                                {fromChain.logoUrl && (
+                                    <img src={fromChain.logoUrl} alt={fromChain.name} className="absolute -bottom-1 -right-1 w-4 h-4 rounded-full border-2 border-[#0A0E27]" />
+                                )}
+                            </div>
+                            <div className="flex flex-col items-start pr-2">
+                                <span className="font-bold text-base leading-tight">{fromToken.symbol}</span>
+                                <span className="text-[10px] text-gray-400 leading-tight">${tokenPrice.toLocaleString()}</span>
+                            </div>
+                            <ChevronDown className="w-4 h-4 text-gray-400" />
+                        </button>
                     </div>
-                    <div className="flex flex-col items-end">
-                        <div className="text-gray-500 text-sm mb-1 flex items-center gap-2">
-                            Balance: {parseFloat(balanceFormatted).toFixed(4)}
-                            <button onClick={handleMax} className="text-[#5EEAD4] text-xs bg-[#5EEAD4]/10 px-2 py-0.5 rounded hover:bg-[#5EEAD4]/20 transition-colors">
-                                MAX
-                            </button>
-                        </div>
+                    <div className="text-gray-500 text-sm mt-1">${usdValue}</div>
+                </div>
+
+                {/* Arrow */}
+                <div className="flex justify-center -my-3 relative z-10">
+                    <div className="bg-[#0A0E27] p-1.5 rounded-xl border border-[#2D5BFF]/20 shadow-lg">
+                        <button onClick={handleSwap} className="p-2 bg-[#131b36] hover:bg-[#1A2235] rounded-lg transition-colors group/arrow">
+                            <ArrowDown className="w-4 h-4 text-[#2D5BFF] group-hover/arrow:text-[#4DFFFF] transition-colors" />
+                        </button>
                     </div>
                 </div>
-            </div>
 
-            {/* Arrow */}
-            <div className="flex justify-center -my-5 relative z-10">
-                <button className="bg-[#1b1b1b] border border-white/5 p-2 rounded-xl hover:bg-[#2b2b2b] transition-colors shadow-lg">
-                    <ArrowDown className="w-5 h-5 text-gray-400" />
-                </button>
-            </div>
-
-            {/* To Section */}
-            <div className="bg-[#1b1b1b] rounded-2xl p-4 mt-2 border border-white/5 shadow-xl">
-                <div className="flex justify-between items-center mb-4">
-                    <div className="flex items-center gap-2">
-                        <span className="text-gray-400 text-sm font-medium">To</span>
+                {/* To Box */}
+                <div className="bg-[#131b36] rounded-xl p-4 border border-transparent hover:border-[#2D5BFF]/30 transition-all group mt-[-10px] pt-6">
+                    <div className="flex justify-between text-gray-400 text-sm mb-3">
+                        <span className="font-medium">To {toChain.name}</span>
                         <div className="flex items-center gap-2">
                             {isEditingRecipient ? (
-                                <div className="flex items-center bg-[#2b2b2b] rounded-lg border border-white/10 px-2 py-1">
+                                <div className="flex items-center bg-[#0A0E27] rounded px-2 py-0.5 border border-[#2D5BFF]/30">
                                     <input
-                                        type="text"
                                         value={recipientAddress}
                                         onChange={(e) => setRecipientAddress(e.target.value)}
+                                        className="bg-transparent text-xs text-white outline-none w-24"
                                         placeholder="0x..."
-                                        className="bg-transparent text-xs text-white outline-none w-32 placeholder-gray-500"
                                         autoFocus
                                     />
-                                    <X className="w-3 h-3 text-gray-400 cursor-pointer hover:text-white ml-2" onClick={() => setIsEditingRecipient(false)} />
+                                    <X className="w-3 h-3 ml-1 cursor-pointer hover:text-white" onClick={() => setIsEditingRecipient(false)} />
                                 </div>
                             ) : (
-                                <button
-                                    onClick={() => setIsEditingRecipient(true)}
-                                    className="text-gray-500 text-xs hover:text-[#5EEAD4] transition-colors flex items-center gap-1"
-                                >
-                                    {recipientAddress ? (
-                                        <span className="text-[#5EEAD4]">{formatAddress(recipientAddress)}</span>
-                                    ) : (
-                                        <span>Set Recipient ✎</span>
-                                    )}
+                                <button onClick={() => setIsEditingRecipient(true)} className="flex items-center gap-1 hover:text-[#2D5BFF] transition-colors">
+                                    {recipientAddress ? formatAddress(recipientAddress) : 'Recipient'}
+                                    <span className="text-xs">✎</span>
                                 </button>
                             )}
                         </div>
                     </div>
-                    {/* Token Selector */}
-                    <button
-                        onClick={() => openSelector('to')}
-                        className="flex items-center gap-2 bg-[#2b2b2b] hover:bg-[#3b3b3b] transition-colors rounded-full py-1.5 px-3 border border-white/5"
-                    >
-                        <div className={`w-6 h-6 rounded-full ${toToken.iconBg} flex items-center justify-center text-[10px] text-white font-bold relative`}>
-                            <span className={`absolute -bottom-1 -right-1 ${toChain.iconBg} rounded-full w-3 h-3 border-2 border-[#2b2b2b]`}></span>
-                            {toToken.symbol[0]}
-                        </div>
-                        <div className="flex flex-col items-start leading-none">
-                            <span className="text-white font-semibold text-sm">{toToken.symbol}</span>
-                            <span className="text-gray-400 text-[10px]">{toChain.name}</span>
-                        </div>
-                        <ChevronDown className="w-4 h-4 text-gray-400" />
-                    </button>
-                </div>
-
-                <div className="flex justify-between items-end">
-                    <div className="flex-1">
+                    <div className="flex justify-between items-center gap-4">
                         {isFetchingQuote ? (
-                            <div className="h-10 flex items-center text-gray-500 animate-pulse">Fetching quote...</div>
+                            <div className="h-10 text-gray-500 animate-pulse flex items-center text-2xl">Fetching...</div>
                         ) : (
                             <input
                                 type="text"
-                                placeholder="0.00"
                                 value={toAmountDisplay}
                                 readOnly
-                                className="bg-transparent text-4xl text-gray-500 font-medium outline-none w-full placeholder-gray-600"
+                                placeholder="0.00"
+                                className="bg-transparent text-4xl text-[#00D4FF] font-medium outline-none w-full placeholder-gray-600 font-space min-w-0"
                             />
                         )}
-                        <div className="text-gray-500 text-sm mt-1">
-                            ${toUsdValue}
-                        </div>
+                        <button
+                            onClick={() => openSelector('to')}
+                            className="flex items-center gap-2 bg-[#0A0E27] hover:bg-[#1A2235] text-white rounded-full pl-2 pr-4 py-1.5 transition-all border border-[#2D5BFF]/20 hover:border-[#2D5BFF]/50 shrink-0"
+                        >
+                            <div className="relative">
+                                {toToken.logoUrl ? (
+                                    <img src={toToken.logoUrl} alt={toToken.symbol} className="w-8 h-8 rounded-full" />
+                                ) : (
+                                    <div className={`w-8 h-8 rounded-full ${toToken.iconBg} flex items-center justify-center text-[10px] font-bold`}>{toToken.symbol[0]}</div>
+                                )}
+                                {toChain.logoUrl && (
+                                    <img src={toChain.logoUrl} alt={toChain.name} className="absolute -bottom-1 -right-1 w-4 h-4 rounded-full border-2 border-[#0A0E27]" />
+                                )}
+                            </div>
+                            <div className="flex flex-col items-start pr-2">
+                                <span className="font-bold text-base leading-tight">{toToken.symbol}</span>
+                                <span className="text-[10px] text-gray-400 leading-tight">${toTokenPrice.toLocaleString()}</span>
+                            </div>
+                            <ChevronDown className="w-4 h-4 text-gray-400" />
+                        </button>
                     </div>
-                    <div className="text-gray-500 text-sm mb-1">
-                        Balance: 0
-                    </div>
+                    <div className="text-gray-500 text-sm mt-1">${toUsdValue}</div>
                 </div>
-                {quote && quote.isAmountTooLow && (
-                    <div className="mt-2 text-red-500 text-xs font-medium text-center bg-red-500/10 py-1.5 rounded-lg border border-red-500/20">
-                        ⚠️ Amount too low. Please increase amount.
-                    </div>
-                )}
-            </div>
 
-            {/* Info Banner */}
-            <div className="bg-[#1b1b1b] rounded-2xl p-3 mt-4 border border-white/5 shadow-xl">
-                <div className="flex justify-between items-center mb-2">
-                    <div className="flex items-center gap-2 text-[#4ADE80]">
-                        <ShieldCheck className="w-4 h-4" />
-                        <span className="text-sm font-bold">Fast & Secure</span>
-                    </div>
-                    <X className="w-4 h-4 text-gray-500 cursor-pointer hover:text-white transition-colors" />
-                </div>
+                {/* Route/Fee Info */}
+                {quote && !quoteError && (
+                    <div className="mt-4 px-3 py-3 bg-[#2D5BFF]/5 rounded-xl border border-[#2D5BFF]/10 text-sm">
+                        <div className="flex justify-between items-center mb-3 pb-2 border-b border-[#2D5BFF]/10">
+                            <div className="flex items-center gap-2 text-white font-medium">
+                                <span className="w-2 h-2 rounded-full bg-[#00D4FF] shadow-[0_0_10px_#00D4FF]"></span>
+                                Across Route
+                            </div>
+                        </div>
 
-                {/* Fee Breakdown */}
-                {quote && quote.totalRelayFee && (
-                    <div className="bg-[#2b2b2b] rounded-lg p-2 mb-3 space-y-1">
-                        <div className="flex justify-between items-center text-xs">
-                            <span className="text-gray-400">Total Fee:</span>
-                            <span className="text-white font-medium">
-                                {formatUnits(BigInt(quote.totalRelayFee.total), fromToken.decimals)} {fromToken.symbol}
-                            </span>
-                        </div>
-                        <div className="flex justify-between items-center text-xs">
-                            <span className="text-gray-500">├ Gas Fee:</span>
-                            <span className="text-gray-400">
-                                {formatUnits(BigInt(quote.relayerGasFee.total), fromToken.decimals)} {fromToken.symbol}
-                            </span>
-                        </div>
-                        <div className="flex justify-between items-center text-xs">
-                            <span className="text-gray-500">├ Capital Fee:</span>
-                            <span className="text-gray-400">
-                                {formatUnits(BigInt(quote.relayerCapitalFee.total), fromToken.decimals)} {fromToken.symbol}
-                            </span>
-                        </div>
-                        {quote.lpFee && (
-                            <div className="flex justify-between items-center text-xs">
-                                <span className="text-gray-500">└ LP Fee:</span>
-                                <span className="text-gray-400">
-                                    {formatUnits(BigInt(quote.lpFee.total), fromToken.decimals)} {fromToken.symbol}
+                        {/* Fee Breakdown */}
+                        <div className="space-y-1.5">
+                            <div className="flex justify-between text-gray-300 text-xs">
+                                <span>Total Fee</span>
+                                <span className="font-medium text-white">
+                                    {quote.fees.totalRelayFee ? `${formatUnits(BigInt(quote.fees.totalRelayFee.total), fromToken.decimals)} ${fromToken.symbol}` : '-'}
                                 </span>
                             </div>
-                        )}
-                        <div className="flex justify-between items-center text-xs pt-1 border-t border-white/5">
-                            <span className="text-gray-400">You'll receive:</span>
-                            <span className="text-[#5EEAD4] font-semibold">
-                                {toAmountDisplay} {toToken.symbol}
-                            </span>
+                            <div className="flex justify-between text-gray-500 text-[10px] pl-2 border-l border-[#2D5BFF]/20 ml-0.5">
+                                <span>Gas Fee</span>
+                                <span>
+                                    {quote.fees.relayerGasFee ? `${formatUnits(BigInt(quote.fees.relayerGasFee.total), fromToken.decimals)} ${fromToken.symbol}` : '-'}
+                                </span>
+                            </div>
+                            <div className="flex justify-between text-gray-500 text-[10px] pl-2 border-l border-[#2D5BFF]/20 ml-0.5">
+                                <span>Capital Fee</span>
+                                <span>
+                                    {quote.fees.relayerCapitalFee ? `${formatUnits(BigInt(quote.fees.relayerCapitalFee.total), fromToken.decimals)} ${fromToken.symbol}` : '-'}
+                                </span>
+                            </div>
+                            {quote.fees.lpFee && (
+                                <div className="flex justify-between text-gray-500 text-[10px] pl-2 border-l border-[#2D5BFF]/20 ml-0.5">
+                                    <span>LP Fee</span>
+                                    <span>
+                                        {formatUnits(BigInt(quote.fees.lpFee.total), fromToken.decimals)} {fromToken.symbol}
+                                    </span>
+                                </div>
+                            )}
+                            <div className="flex justify-between text-gray-500 text-[10px] pl-2 border-l border-[#2D5BFF]/20 ml-0.5">
+                                <span>Platform Fee</span>
+                                <span>
+                                    {fromAmount ? (Number(fromAmount) * APP_FEE_PERCENTAGE).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 6 }) : '0.00'} {toToken.symbol}
+                                </span>
+                            </div>
                         </div>
                     </div>
                 )}
 
-                {/* Main Action Button */}
+                {quoteError && (
+                    <div className="mt-4 p-3 bg-red-500/10 border border-red-500/20 rounded-xl flex gap-2 items-start text-sm text-red-200">
+                        <Info className="w-4 h-4 shrink-0 mt-0.5 text-red-400" />
+                        <div>
+                            <div className="font-bold text-red-400">Route Error</div>
+                            {quoteError}
+                        </div>
+                    </div>
+                )}
+
+                {/* Main Button */}
                 {!isConnected ? (
                     <button
                         onClick={handleConnect}
-                        className="w-full bg-[#5EEAD4] hover:bg-[#4dd6c1] text-[#0f172a] font-bold py-3.5 rounded-xl transition-all hover:scale-[1.01] active:scale-[0.99] flex items-center justify-center gap-2 shadow-[0_0_20px_rgba(94,234,212,0.3)]"
+                        className="w-full mt-4 bg-[#2D5BFF] hover:bg-[#1a40cc] text-white font-bold py-4 rounded-xl text-lg transition-all shadow-[0_0_20px_rgba(45,91,255,0.3)] hover:shadow-[0_0_30px_rgba(45,91,255,0.5)] active:scale-[0.99]"
                     >
-                        <Wallet className="w-5 h-5" />
                         Connect Wallet
                     </button>
                 ) : (
-                    <div className="flex flex-col gap-2">
-                        {isWrongChain ? (
-                            <button
-                                onClick={handleSwitchChain}
-                                disabled={isSwitchingChain}
-                                className="w-full bg-[#fbbf24] hover:bg-[#f59e0b] text-[#0f172a] font-bold py-3.5 rounded-xl transition-all hover:scale-[1.01] active:scale-[0.99] flex items-center justify-center gap-2"
-                            >
-                                {isSwitchingChain && <div className="w-5 h-5 animate-spin border-2 border-[#0f172a]/20 border-t-[#0f172a] rounded-full"></div>}
-                                {isSwitchingChain ? 'Switching...' : `Switch to ${fromChain.name}`}
-                            </button>
-                        ) : needsApproval ? (
-                            <button
-                                onClick={handleApprove}
-                                disabled={isApproving || isWaitingApprove}
-                                className="w-full bg-[#fcd34d] hover:bg-[#fbbf24] text-[#0f172a] font-bold py-3.5 rounded-xl transition-all hover:scale-[1.01] active:scale-[0.99] flex items-center justify-center gap-2"
-                            >
-                                {(isApproving || isWaitingApprove) && <div className="w-5 h-5 animate-spin border-2 border-white/20 border-t-white rounded-full"></div>}
-                                {isApproving ? 'Approving...' : isWaitingApprove ? 'Waiting Confirmation...' : `Approve ${fromToken.symbol}`}
-                            </button>
-                        ) : (
-                            <button
-                                onClick={handleBridge}
-                                disabled={!fromAmount || !!quoteError || isDepositing || isWaitingDeposit || isFetchingQuote || (quote?.isAmountTooLow ?? false)}
-                                className="w-full bg-[#5EEAD4] hover:bg-[#4dd6c1] text-[#0f172a] font-bold py-3.5 rounded-xl transition-all hover:scale-[1.01] active:scale-[0.99] flex items-center justify-center gap-2 shadow-[0_0_20px_rgba(94,234,212,0.3)] disabled:opacity-50 disabled:cursor-not-allowed"
-                            >
-                                {(isDepositing || isWaitingDeposit) && <div className="w-5 h-5 animate-spin border-2 border-[#0f172a]/20 border-t-[#0f172a] rounded-full"></div>}
-                                {isDepositing ? 'Bridging...' : isWaitingDeposit ? 'Finalizing...' : 'Bridge Funds'}
-                            </button>
-                        )}
-
-                        <div className="text-xs text-center text-gray-500 cursor-pointer hover:text-white" onClick={() => disconnect()}>
-                            {isWrongChain && (
-                                <div className="mb-1 text-yellow-500 font-medium">
-                                    ⚠️ Connected to {connectedChain?.name || 'Unknown Network'}
-                                </div>
-                            )}
-                            Disconnect {formatAddress(address || '')}
-                        </div>
-                    </div>
+                    <button
+                        onClick={() => {
+                            if (isWrongChain) {
+                                handleSwitchChain();
+                            } else if (needsApproval) {
+                                handleApprove();
+                            } else {
+                                handleBridge();
+                            }
+                        }}
+                        disabled={!isWrongChain && !needsApproval && (!fromAmount || !!quoteError || isDepositing || isFetchingQuote)}
+                        className={`w-full mt-4 font-bold py-4 rounded-xl text-lg transition-all active:scale-[0.99] flex justify-center items-center gap-2 ${isWrongChain ? 'bg-[#ff9f0a] hover:bg-[#d98200] text-black shadow-[0_0_20px_rgba(255,159,10,0.3)]' :
+                            needsApproval ? 'bg-[#ffd60a] hover:bg-[#ccab00] text-black shadow-[0_0_20px_rgba(255,214,10,0.3)]' :
+                                'bg-[#2D5BFF] hover:bg-[#00D4FF] text-white shadow-[0_0_20px_rgba(45,91,255,0.3)]'
+                            } disabled:opacity-50 disabled:cursor-not-allowed`}
+                    >
+                        {(isDepositing || isApproving || isSwitchingChain) && <div className="w-5 h-5 border-2 border-current border-t-transparent rounded-full animate-spin" />}
+                        {isWrongChain ? `Switch to ${fromChain.name}` :
+                            needsApproval ? (isApproving ? 'Approving...' : 'Approve') :
+                                (isDepositing ? 'Bridging...' : 'Bridge Funds')}
+                    </button>
                 )}
+            </div>
+
+            {/* Powered By */}
+            <div className="absolute -bottom-10 left-0 text-gray-500 text-xs font-mono flex items-center gap-1.5 opacity-60 hover:opacity-100 transition-opacity">
+                <div className="w-2 h-2 bg-[#2D5BFF] rounded-full animate-pulse" />
+                Powered by Across API
             </div>
         </div>
     );
