@@ -122,12 +122,16 @@ export interface Route {
     destinationToken: string;
 }
 
-let cachedRoutes: Route[] | null = null;
+// Cache keyed by environment 'testnet' | 'mainnet'
+const cachedRoutes = new Map<string, Route[]>();
 
 export async function getAvailableRoutes(isTestnet: boolean): Promise<Route[]> {
-    // Use cache if available and matching environment (simplification: assume invalidation on reload or check length/basic prop)
-    // For now, simple in-memory cache
-    if (cachedRoutes) return cachedRoutes;
+    const environment = isTestnet ? 'testnet' : 'mainnet';
+
+    // Return cached data for the specific environment if available
+    if (cachedRoutes.has(environment)) {
+        return cachedRoutes.get(environment)!;
+    }
 
     try {
         const baseUrl = isTestnet ? 'https://testnet.across.to/api' : 'https://app.across.to/api';
@@ -135,10 +139,11 @@ export async function getAvailableRoutes(isTestnet: boolean): Promise<Route[]> {
         if (!response.ok) throw new Error('Failed to fetch routes');
 
         const routes = await response.json();
-        cachedRoutes = routes;
+        // Store in cache specific to this environment
+        cachedRoutes.set(environment, routes);
         return routes;
     } catch (error) {
-        console.error("Error fetching available routes:", error);
+        console.error(`Error fetching available routes for ${environment}:`, error);
         return [];
     }
 }

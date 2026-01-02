@@ -1,4 +1,5 @@
 
+import { useMemo } from 'react';
 
 interface DoodleShape {
     id: number;
@@ -35,7 +36,7 @@ const BackgroundDoodles = () => {
         return shapes;
     };
 
-    const doodles = generateDoodles();
+    const doodles = useMemo(() => generateDoodles(), []);
 
     const renderShape = (shape: DoodleShape) => {
         const style = {
@@ -78,11 +79,11 @@ const BackgroundDoodles = () => {
     };
 
     // Generate static grid points for constellation effect
-    const gridPoints = Array.from({ length: 40 }, (_, i) => ({
+    const gridPoints = useMemo(() => Array.from({ length: 40 }, (_, i) => ({
         id: i,
         x: Math.random() * 100,
         y: Math.random() * 100,
-    }));
+    })), []);
 
     return (
         <div className="fixed inset-0 pointer-events-none overflow-hidden z-0 bg-[#050b1c]">

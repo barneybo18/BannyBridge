@@ -44,11 +44,17 @@ const BridgeWidget = () => {
         }
     }, [isTestnet]);
 
-    const [fromChain, setFromChain] = useState<Chain>(CHAINS[4]); // Defaults to be overwritten by effect
-    const [fromToken, setFromToken] = useState<Token>(CHAINS[4].tokens[0]);
+    const [fromChain, setFromChain] = useState<Chain>(() => activeChains[isTestnet ? 0 : 4]);
+    const [fromToken, setFromToken] = useState<Token>(() => {
+        const chain = activeChains[isTestnet ? 0 : 4];
+        return isTestnet ? chain.tokens[0] : (chain.tokens.find(t => t.symbol === 'USDC') || chain.tokens[1]);
+    });
 
-    const [toChain, setToChain] = useState<Chain>(CHAINS[5]);
-    const [toToken, setToToken] = useState<Token>(CHAINS[5].tokens[0]);
+    const [toChain, setToChain] = useState<Chain>(() => activeChains[isTestnet ? 1 : 5]);
+    const [toToken, setToToken] = useState<Token>(() => {
+        const chain = activeChains[isTestnet ? 1 : 5];
+        return isTestnet ? chain.tokens[0] : (chain.tokens.find(t => t.symbol === 'USDC') || chain.tokens[1]);
+    });
 
     // Selector state
     const [selectorOpen, setSelectorOpen] = useState(false);
@@ -271,7 +277,7 @@ const BridgeWidget = () => {
             // Simple success check logic - if hash exists and not waiting, assume mined
             setTxStatus('success');
         }
-    }, [isWaitingDeposit, depositTxHash, showModal]);
+    }, [isWaitingDeposit, depositTxHash, showModal, txStatus]);
 
     const needsApproval = !fromToken.isNative && fromAmount && allowance !== undefined && allowance < parseUnits(fromAmount, fromToken.decimals);
 
@@ -328,8 +334,12 @@ const BridgeWidget = () => {
                         </div>
                     </div>
                     <div className="flex gap-2 relative">
-                        <button className="text-gray-400 hover:text-white transition-colors p-2 hover:bg-white/5 rounded-lg">
-                            <RefreshCw className={`w-4 h-4 ${isFetchingQuote ? 'animate-spin' : ''}`} onClick={handleRefreshQuote} />
+                        <button
+                            type="button"
+                            className="text-gray-400 hover:text-white transition-colors p-2 hover:bg-white/5 rounded-lg"
+                            onClick={handleRefreshQuote}
+                        >
+                            <RefreshCw className={`w-4 h-4 ${isFetchingQuote ? 'animate-spin' : ''}`} />
                         </button>
                         <button
                             className="text-gray-400 hover:text-white transition-colors p-2 hover:bg-white/5 rounded-lg"
@@ -539,7 +549,15 @@ const BridgeWidget = () => {
                     </button>
                 ) : (
                     <button
-                        onClick={isWrongChain ? handleSwitchChain : needsApproval ? handleApprove : handleBridge}
+                        onClick={() => {
+                            if (isWrongChain) {
+                                handleSwitchChain();
+                            } else if (needsApproval) {
+                                handleApprove();
+                            } else {
+                                handleBridge();
+                            }
+                        }}
                         disabled={!isWrongChain && !needsApproval && (!fromAmount || !!quoteError || isDepositing || isFetchingQuote)}
                         className={`w-full mt-4 font-bold py-4 rounded-xl text-lg transition-all active:scale-[0.99] flex justify-center items-center gap-2 ${isWrongChain ? 'bg-[#ff9f0a] hover:bg-[#d98200] text-black shadow-[0_0_20px_rgba(255,159,10,0.3)]' :
                             needsApproval ? 'bg-[#ffd60a] hover:bg-[#ccab00] text-black shadow-[0_0_20px_rgba(255,214,10,0.3)]' :
