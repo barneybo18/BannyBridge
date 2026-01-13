@@ -1,7 +1,7 @@
 
 // Simple price cache to avoid excessive API calls
 const priceCache: { [key: string]: { price: number; timestamp: number } } = {};
-const CACHE_DURATION = 60000; // 1 minute
+const CACHE_DURATION = 30000; // 30 seconds (reduced for more real-time updates)
 
 // Map token symbols to CoinGecko IDs
 const TOKEN_ID_MAP: { [symbol: string]: string } = {
@@ -21,6 +21,19 @@ const TOKEN_ID_MAP: { [symbol: string]: string } = {
     // Wrapped tokens
     'WBTC': 'wrapped-bitcoin',
 };
+
+// Function to invalidate cache for fresh price fetches
+export function invalidatePriceCache(symbol?: string): void {
+    if (symbol) {
+        const tokenId = TOKEN_ID_MAP[symbol.toUpperCase()];
+        if (tokenId && priceCache[tokenId]) {
+            delete priceCache[tokenId];
+        }
+    } else {
+        // Clear all cache
+        Object.keys(priceCache).forEach(key => delete priceCache[key]);
+    }
+}
 
 export async function getTokenPrice(symbol: string): Promise<number> {
     const tokenId = TOKEN_ID_MAP[symbol.toUpperCase()];

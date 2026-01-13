@@ -16,23 +16,31 @@ interface TransactionModalProps {
 
 const TransactionModal = ({ isOpen, status, txHash, onClose, errorMsg, fromChainName, toChainName, tokenSymbol, amount, explorerUrl }: TransactionModalProps) => {
     const [seconds, setSeconds] = useState(0);
+    const [timerStarted, setTimerStarted] = useState(false);
 
+    // Only start timer when txHash is available (wallet confirmed)
     useEffect(() => {
         let interval: ReturnType<typeof setInterval>;
-        if (isOpen && status === 'processing') {
+        if (isOpen && status === 'processing' && txHash) {
+            // Start the timer only after wallet confirmation
+            if (!timerStarted) {
+                setSeconds(0);
+                setTimerStarted(true);
+            }
             interval = setInterval(() => {
                 setSeconds(s => s + 1);
             }, 1000);
         }
         return () => clearInterval(interval);
-    }, [isOpen, status]);
+    }, [isOpen, status, txHash, timerStarted]);
 
-    // Reset timer on open
+    // Reset timer state when modal closes or new transaction
     useEffect(() => {
-        if (isOpen && status === 'processing') {
+        if (!isOpen) {
             setSeconds(0);
+            setTimerStarted(false);
         }
-    }, [isOpen, status]);
+    }, [isOpen]);
 
     if (!isOpen) return null;
 
@@ -78,31 +86,44 @@ const TransactionModal = ({ isOpen, status, txHash, onClose, errorMsg, fromChain
 
                     {/* Title & Desc */}
                     <h3 className="text-2xl font-bold text-white mb-2 font-space">
-                        {status === 'processing' && 'Processing Transaction...'}
+                        {status === 'processing' && !txHash && 'Confirm in Wallet'}
+                        {status === 'processing' && txHash && 'Processing Transaction...'}
                         {status === 'success' && 'Bridge Successful!'}
                         {status === 'error' && 'Transaction Failed'}
                     </h3>
 
                     <p className="text-gray-400 mb-6 text-sm">
-                        {status === 'processing' && `Bridging ${amount} ${tokenSymbol} from ${fromChainName} to ${toChainName}`}
+                        {status === 'processing' && !txHash && 'Please confirm the transaction in your wallet to proceed.'}
+                        {status === 'processing' && txHash && `Bridging ${amount} ${tokenSymbol} from ${fromChainName} to ${toChainName}`}
                         {status === 'success' && `Successfully bridged ${amount} ${tokenSymbol} to ${toChainName}!`}
                         {status === 'error' && (errorMsg || 'Something went wrong. Please try again.')}
                     </p>
 
-                    {/* Timer / Check Details */}
+                    {/* Timer / Check Details - Only show after wallet confirmation */}
                     <div className="w-full bg-[#1A1F35] rounded-xl p-4 mb-4 border border-white/5">
-                        <div className="flex justify-between items-center text-sm">
-                            <span className="text-gray-500 flex items-center gap-2">
-                                <Timer className="w-4 h-4" /> Time Elapsed
-                            </span>
-                            <span className="text-white font-mono font-bold">
-                                {new Date(seconds * 1000).toISOString().substr(14, 5)}
-                            </span>
-                        </div>
-                        {status === 'processing' && (
-                            <div className="w-full bg-gray-800 h-1 mt-3 rounded-full overflow-hidden">
-                                <div className="bg-[#2D5BFF] h-full rounded-full animate-progress-indeterminate"></div>
+                        {status === 'processing' && !txHash ? (
+                            <div className="flex flex-col items-center gap-2">
+                                <div className="flex items-center gap-2 text-amber-400">
+                                    <div className="w-2 h-2 bg-amber-400 rounded-full animate-pulse"></div>
+                                    <span className="text-sm font-medium">Waiting for wallet confirmation...</span>
+                                </div>
                             </div>
+                        ) : (
+                            <>
+                                <div className="flex justify-between items-center text-sm">
+                                    <span className="text-gray-500 flex items-center gap-2">
+                                        <Timer className="w-4 h-4" /> Time Elapsed
+                                    </span>
+                                    <span className="text-white font-mono font-bold">
+                                        {new Date(seconds * 1000).toISOString().substr(14, 5)}
+                                    </span>
+                                </div>
+                                {status === 'processing' && (
+                                    <div className="w-full bg-gray-800 h-1 mt-3 rounded-full overflow-hidden">
+                                        <div className="bg-[#2D5BFF] h-full rounded-full animate-progress-indeterminate"></div>
+                                    </div>
+                                )}
+                            </>
                         )}
                     </div>
 

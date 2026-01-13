@@ -7,7 +7,7 @@ import { CHAINS, TESTNET_CHAINS } from '../constants/chains';
 import type { Chain, Token } from '../constants/chains';
 import { ERC20_ABI, SPOKE_POOL_ABI, SPOKE_POOL_ADDRESSES, WETH_ADDRESSES } from '../constants/contracts';
 import { getQuote, type QuoteResult } from '../utils/acrossApi';
-import { getTokenPrice } from '../utils/priceApi';
+import { getTokenPrice, invalidatePriceCache } from '../utils/priceApi';
 
 import { APP_FEE_PERCENTAGE } from '../constants/integrator';
 import TransactionModal from './TransactionModal';
@@ -74,14 +74,14 @@ const BridgeWidget = () => {
     const { switchChain, isPending: isSwitchingChain } = useSwitchChain(); // preserving this line as is
 
     // Balance fetching (Native)
-    const { data: nativeBalance } = useBalance({
+    const { data: nativeBalance, refetch: refetchNativeBalance } = useBalance({
         address,
         chainId: fromChain.id,
         query: { enabled: !!address && fromToken.isNative }
     });
 
     // Balance fetching (ERC20)
-    const { data: tokenBalance } = useReadContract({
+    const { data: tokenBalance, refetch: refetchTokenBalance } = useReadContract({
         address: fromToken.address as `0x${string}`,
         abi: ERC20_ABI,
         functionName: 'balanceOf',
@@ -99,35 +99,40 @@ const BridgeWidget = () => {
     const [quoteError, setQuoteError] = useState<string | null>(null);
     const [tokenPrice, setTokenPrice] = useState<number>(1);
     const [toTokenPrice, setToTokenPrice] = useState<number>(1);
-    // const [refreshCountdown, setRefreshCountdown] = useState<number>(30); // Removed unused state
     const [refreshTrigger, setRefreshTrigger] = useState<number>(0);
+    const [priceRefreshTrigger, setPriceRefreshTrigger] = useState<number>(0);
 
-    // Fetch prices and quotes (logic remains the same, omitted for brevity but included in full file)
+    // Fetch prices with real-time updates (polling every 30 seconds)
     useEffect(() => {
         let isCancelled = false;
-        const fetchPrice = async () => {
-            console.log(`[PriceEffect] Fetching price for ${fromToken.symbol} on chain ${fromChain.id}`);
-            const price = await getTokenPrice(fromToken.symbol);
-            if (!isCancelled) {
-                console.log(`[PriceEffect] Set tokenPrice to ${price}`);
-                setTokenPrice(price);
-            }
-        };
-        fetchPrice();
-        return () => { isCancelled = true; };
-    }, [fromToken.symbol, fromChain.id]);
+        let priceInterval: number;
 
-    useEffect(() => {
-        let isCancelled = false;
-        const fetchPrice = async () => {
-            const price = await getTokenPrice(toToken.symbol);
+        const fetchPrices = async () => {
+            console.log(`[PriceEffect] Fetching prices for ${fromToken.symbol} and ${toToken.symbol}`);
+            const [fromPrice, toPrice] = await Promise.all([
+                getTokenPrice(fromToken.symbol),
+                getTokenPrice(toToken.symbol)
+            ]);
             if (!isCancelled) {
-                setToTokenPrice(price);
+                console.log(`[PriceEffect] Set tokenPrice to ${fromPrice}, toTokenPrice to ${toPrice}`);
+                setTokenPrice(fromPrice);
+                setToTokenPrice(toPrice);
             }
         };
-        fetchPrice();
-        return () => { isCancelled = true; };
-    }, [toToken.symbol]);
+
+        // Initial fetch
+        fetchPrices();
+
+        // Set up polling every 30 seconds for real-time updates
+        priceInterval = setInterval(() => {
+            fetchPrices();
+        }, 30000);
+
+        return () => {
+            isCancelled = true;
+            if (priceInterval) clearInterval(priceInterval);
+        };
+    }, [fromToken.symbol, toToken.symbol, fromChain.id, priceRefreshTrigger]);
 
     useEffect(() => {
         let isCancelled = false;
@@ -189,7 +194,7 @@ const BridgeWidget = () => {
 
     // Contract interactions
     const spokePoolAddress = SPOKE_POOL_ADDRESSES[fromChain.id];
-    const { data: allowance, refetch: refetchAllowance } = useReadContract({
+    const { data: allowance, refetch: refetchAllowance, isLoading: isAllowanceLoading } = useReadContract({
         address: fromToken.address as `0x${string}`,
         abi: ERC20_ABI,
         functionName: 'allowance',
@@ -201,7 +206,7 @@ const BridgeWidget = () => {
     const { writeContract: writeDeposit, isPending: isDepositing, data: depositTxHash } = useWriteContract();
     // Removed unused useSendTransaction
 
-    const { isLoading: _isWaitingApprove, isSuccess: isApproveSuccess } = useWaitForTransactionReceipt({ hash: approveTxHash });
+    const { isLoading: isWaitingApprove, isSuccess: isApproveSuccess } = useWaitForTransactionReceipt({ hash: approveTxHash });
     useEffect(() => { if (isApproveSuccess) refetchAllowance(); }, [isApproveSuccess, refetchAllowance]);
 
     const { isLoading: isWaitingDeposit } = useWaitForTransactionReceipt({ hash: depositTxHash });
@@ -220,8 +225,8 @@ const BridgeWidget = () => {
     const handleMax = () => { if (balanceFormatted) setFromAmount(balanceFormatted); };
 
     const handleApprove = () => {
-        const maxApproval = BigInt('0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff');
-        writeApprove({ address: fromToken.address as `0x${string}`, abi: ERC20_ABI, functionName: 'approve', args: [spokePoolAddress, maxApproval], chainId: fromChain.id });
+        const amountToApprove = parseUnits(fromAmount, fromToken.decimals);
+        writeApprove({ address: fromToken.address as `0x${string}`, abi: ERC20_ABI, functionName: 'approve', args: [spokePoolAddress, amountToApprove], chainId: fromChain.id });
     };
 
     const handleSwap = () => {
@@ -274,12 +279,29 @@ const BridgeWidget = () => {
         if (isWaitingDeposit) {
             setTxStatus('processing');
         } else if (depositTxHash && !isWaitingDeposit && showModal && txStatus !== 'error') {
-            // Simple success check logic - if hash exists and not waiting, assume mined
+            // Transaction success - update status and refresh all data
             setTxStatus('success');
-        }
-    }, [isWaitingDeposit, depositTxHash, showModal, txStatus]);
 
-    const needsApproval = !fromToken.isNative && fromAmount && allowance !== undefined && allowance < parseUnits(fromAmount, fromToken.decimals);
+            // Invalidate price cache and trigger immediate refresh
+            invalidatePriceCache();
+            setPriceRefreshTrigger(prev => prev + 1);
+
+            // Refresh balances after a short delay to allow chain state to update
+            setTimeout(() => {
+                if (fromToken.isNative) {
+                    refetchNativeBalance();
+                } else {
+                    refetchTokenBalance();
+                }
+            }, 2000);
+
+            // Also refresh the quote
+            setRefreshTrigger(prev => prev + 1);
+        }
+    }, [isWaitingDeposit, depositTxHash, showModal, txStatus, fromToken.isNative, refetchNativeBalance, refetchTokenBalance]);
+
+    const needsApproval = !fromToken.isNative && !!fromAmount && allowance !== undefined && allowance < parseUnits(fromAmount, fromToken.decimals);
+    const isApprovalProcessing = isApproving || isWaitingApprove;
 
     let toAmountDisplay = '';
     try {
@@ -558,16 +580,17 @@ const BridgeWidget = () => {
                                 handleBridge();
                             }
                         }}
-                        disabled={!isWrongChain && !needsApproval && (!fromAmount || !!quoteError || isDepositing || isFetchingQuote)}
+                        disabled={!isWrongChain && ((!needsApproval && (!fromAmount || !!quoteError || isDepositing || isFetchingQuote)) || (needsApproval && (isApprovalProcessing || isAllowanceLoading)))}
                         className={`w-full mt-4 font-bold py-4 rounded-xl text-lg transition-all active:scale-[0.99] flex justify-center items-center gap-2 ${isWrongChain ? 'bg-[#ff9f0a] hover:bg-[#d98200] text-black shadow-[0_0_20px_rgba(255,159,10,0.3)]' :
                             needsApproval ? 'bg-[#ffd60a] hover:bg-[#ccab00] text-black shadow-[0_0_20px_rgba(255,214,10,0.3)]' :
                                 'bg-[#2D5BFF] hover:bg-[#00D4FF] text-white shadow-[0_0_20px_rgba(45,91,255,0.3)]'
                             } disabled:opacity-50 disabled:cursor-not-allowed`}
                     >
-                        {(isDepositing || isApproving || isSwitchingChain) && <div className="w-5 h-5 border-2 border-current border-t-transparent rounded-full animate-spin" />}
+                        {(isDepositing || isApprovalProcessing || isSwitchingChain) && <div className="w-5 h-5 border-2 border-current border-t-transparent rounded-full animate-spin" />}
                         {isWrongChain ? `Switch to ${fromChain.name}` :
-                            needsApproval ? (isApproving ? 'Approving...' : 'Approve') :
-                                (isDepositing ? 'Bridging...' : 'Bridge Funds')}
+                            needsApproval ? (isApprovalProcessing ? 'Approving...' : 'Approve') :
+                                isAllowanceLoading && !fromToken.isNative ? 'Checking Allowance...' :
+                                    (isDepositing ? 'Bridging...' : 'Bridge Funds')}
                     </button>
                 )}
             </div>
